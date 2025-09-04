@@ -1,7 +1,6 @@
-#установка библиотек и импорт модулей - 1-ая йчейка если в Google Colab, в локальной IDE (PyCharm, VSCode) - установить в терминале без ! 
-
+##################### 1-ая йчейка если в Google Colab, в локальной IDE (PyCharm, VSCode) - установить в терминале ###############
+###установка библиотек и импорт модулей в Google Colab, в локальной IDE (PyCharm, VSCode) - установить в терминале без ! 
 !pip install faker pyarrow pyiceberg 
-
 import os
 import shutil
 import random
