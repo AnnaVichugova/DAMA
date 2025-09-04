@@ -1,6 +1,5 @@
 #установка библиотек и импорт модулей - 1-ая йчейка если в Google Colab, в локальной IDE (PyCharm, VSCode) - установить в терминале без ! 
 
-!pip install faker pyarrow pyiceberg 
 !pip install --upgrade great_expectations 
 
 import os
@@ -14,14 +13,6 @@ import great_expectations as gx
 import warnings
 
 from faker import Faker
-from pyiceberg.catalog import load_catalog
-from pyiceberg.schema import Schema
-from pyiceberg.types import StringType, IntegerType, NestedField, BooleanType, TimestampType, DoubleType, DateType
-from pyiceberg.catalog import Catalog, load_catalog
-from pyiceberg.table import Table
-from pyiceberg.io.pyarrow import PyArrowFileIO
-from pyiceberg.partitioning import PartitionSpec, PartitionField
-from pyiceberg.transforms import DayTransform, IdentityTransform
 
 ############################ 2-ая йчейка если в Google Colab #########################################
 #Генерация parquet-файлов
