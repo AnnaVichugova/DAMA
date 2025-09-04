@@ -1,0 +1,309 @@
+#установка библиотек и импорт модулей - 1-ая йчейка если в Google Colab, в локальной IDE (PyCharm, VSCode) - установить в терминале без ! 
+
+!pip install faker pyarrow pyiceberg 
+
+import os
+import shutil
+import random
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import warnings
+
+from faker import Faker
+from pyiceberg.expressions import *
+from pyiceberg.catalog import load_catalog
+from pyiceberg.schema import Schema
+from pyiceberg.types import StringType, IntegerType, NestedField, BooleanType, TimestampType, DoubleType, DateType
+from pyiceberg.catalog import Catalog, load_catalog
+from pyiceberg.table import Table
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.partitioning import PartitionSpec, PartitionField
+from pyiceberg.transforms import DayTransform, IdentityTransform
+
+############################ 2-ая йчейка если в Google Colab #########################################
+#Генерация parquet-файлов
+N_BASE = 100000            # базовое количество записей
+DUP_RATE = 0.12           # доля дублированных строк (точные дубли)
+OUT_DIR = "/content/customers_2025"
+NULL_PROBS = {
+    "email": 0.07,
+    "phone": 0.12,
+    "address": 0.08,
+    "city": 0.06,
+    "region": 0.06,
+    "postal_code": 0.05,
+    "birth_date": 0.03,
+    "income": 0.07,
+    "last_purchase_date": 0.25,  # у части клиентов нет покупок
+}
+
+# Инициализация
+fake = Faker("ru_RU")
+
+# Вспомогательные функции
+def random_dates_in_2025(n: int) -> pd.Series:
+    start = pd.Timestamp("2025-01-01")
+    end = pd.Timestamp("2025-12-31")
+    days = (end - start).days + 1
+    offs = np.random.randint(0, days, size=n)
+    return start + pd.to_timedelta(offs, unit="D")
+
+def random_date_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.Timestamp:
+    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts < start_ts:
+        return pd.NaT
+    delta_days = (end_ts - start_ts).days
+    if delta_days < 0:
+        return pd.NaT
+    return start_ts + pd.to_timedelta(np.random.randint(0, delta_days + 1), unit="D")
+
+def clip_int(arr, min_v):
+    arr = np.array(arr, dtype=float)
+    arr = np.where(arr < min_v, min_v, arr)
+    return arr.astype(int)
+
+# Генерация базовых данных
+record_date = random_dates_in_2025(N_BASE)
+first_names = [fake.first_name() for _ in range(N_BASE)]
+last_names  = [fake.last_name() for _ in range(N_BASE)]
+
+birth_dates = [pd.Timestamp(fake.date_of_birth(minimum_age=18, maximum_age=80)) for _ in range(N_BASE)]
+
+emails = [fake.free_email() for _ in range(N_BASE)]
+phones = [fake.phone_number() for _ in range(N_BASE)]
+cities = [fake.city() for _ in range(N_BASE)]
+regions = [fake.region() for _ in range(N_BASE)]
+postal_codes = [fake.postcode() for _ in range(N_BASE)]
+countries = ["Россия"] * N_BASE
+addresses = [fake.address().replace("\n", ", ") for _ in range(N_BASE)]
+
+# signup_date не позже record_date
+signup_dates = []
+for i in range(N_BASE):
+    rd = record_date[i]
+    # Регистрация с 2015-01-01 до даты записи
+    start = pd.Timestamp("2015-01-01")
+    signup_dates.append(random_date_between(start, rd))
+
+
+# последняя покупка между signup_date и record_date для части клиентов
+last_purchase_dates = []
+for i in range(N_BASE):
+    if np.random.rand() < (1 - NULL_PROBS["last_purchase_date"]):
+        last_purchase_dates.append(random_date_between(signup_dates[i], record_date[i]))
+    else:
+        last_purchase_dates.append(pd.NaT)
+
+# сумма трат зависима от наличия покупок
+total_spent = []
+for lp in last_purchase_dates:
+    if pd.isna(lp):
+        total_spent.append(0.0 if np.random.rand() < 0.9 else float(np.random.gamma(1.5, 20000)))
+    else:
+        total_spent.append(float(np.random.gamma(2.0, 35000)))
+total_spent = np.round(total_spent, 2)
+
+# VIP как функция трат и случайности
+is_vip = (np.array(total_spent) > 300000) | (np.random.rand(N_BASE) < 0.03)
+
+# churned, если давно не покупал относительно даты записи
+churned = []
+for i in range(N_BASE):
+    rd = record_date[i]
+    lp = last_purchase_dates[i]
+    if pd.isna(lp):
+        churned.append(bool(np.random.rand() < 0.6))
+    else:
+        churned.append(bool((rd - lp).days > 180))
+
+df_base = pd.DataFrame({
+    "record_date": record_date,
+    "first_name": first_names,
+    "last_name": last_names,
+    "birth_date": birth_dates,
+    "email": emails,
+    "phone": phones,
+    "address": addresses,
+    "city": cities,
+    "region": regions,
+    "postal_code": postal_codes,
+    "country": countries,
+    "signup_date": signup_dates,
+    "last_purchase_date": last_purchase_dates,
+    "total_spent": total_spent,
+    "is_vip": is_vip,
+    "churned": churned,
+})
+
+# Добавляем дубли
+n_dups = int(N_BASE * DUP_RATE)
+dup_idx = np.random.choice(df_base.index, size=n_dups, replace=True)
+df_dups = df_base.loc[dup_idx].copy()
+df = pd.concat([df_base, df_dups], ignore_index=True)
+
+# Вставляем пропуски
+for col, p in NULL_PROBS.items():
+    if col not in df.columns:
+        continue
+    mask = np.random.rand(len(df)) < p
+    if np.issubdtype(df[col].dtype, np.number):
+        df.loc[mask, col] = np.nan
+    else:
+        df.loc[mask, col] = None
+
+# Партиционирование по месяцам и сохранение в Parquet
+# Готовим метки месяца для имени файла
+df["mm"] = df["record_date"].dt.strftime("%m")
+df["yy"] = df["record_date"].dt.strftime("%y")
+df["month"] = df["record_date"].dt.strftime("%Y-%m")  # оставлю для отчёта
+
+# Чистим выходную папку, если была
+if os.path.exists(OUT_DIR):
+    shutil.rmtree(OUT_DIR)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Сохраняем по одному файлу на месяц в OUT_DIR
+for (mm, yy), part in df.groupby(["mm", "yy"]):
+    fname = f"cust_{mm}_{yy}.parquet"  # например, cust_01_25.parquet
+    part_out = part.drop(columns=["mm", "yy"])  # служебные колонки не пишем
+    part_out.to_parquet(
+        os.path.join(OUT_DIR, fname),
+        engine="pyarrow",
+        index=False,
+        compression="snappy",
+    )
+
+# Вывод в консоли
+print(f"Датасет сохранён в: {OUT_DIR}")
+print(f"Базовых строк: {len(df_base):,}".replace(",", " "))
+print(f"Добавлено дублей: {len(df_dups):,}".replace(",", " "))
+print(f"Итого строк: {len(df):,}".replace(",", " "))
+print("\nРаспределение по месяцам:")
+print(df["month"].value_counts().sort_index())
+
+############################ 3-ая йчейка если в Google Colab #######################################
+#Создание таблицы Iceberg поверх Parquet-файлов для организации Data LakeHouse 
+
+# Читаем все Parquet-файлы из директории в единый DataFrame
+dir_path = "/content/customers_2025"
+files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith(".parquet")]
+
+df = pd.DataFrame()
+
+if files:
+    try:
+        dfs = [pd.read_parquet(p) for p in files]
+        df = pd.concat(dfs, ignore_index=True)
+        print("df создан:", df.shape)
+    except Exception as e:
+        print("Ошибка чтения Parquet-файлов:", e)
+        df = pd.DataFrame()
+else:
+    print("Папка пуста или не содержит parquet-файлов")
+
+
+# Определяем схему Iceberg на основе структуры dataframe
+iceberg_schema = Schema(
+    NestedField(1, "record_date", DateType()),
+    NestedField(2, "first_name", StringType()),
+    NestedField(3, "last_name", StringType()),
+    NestedField(4, "birth_date", DateType()),
+    NestedField(5, "email", StringType()),
+    NestedField(6, "phone", StringType()),
+    NestedField(7, "address", StringType()),
+    NestedField(8, "city", StringType()),
+    NestedField(9, "region", StringType()),
+    NestedField(10, "postal_code", StringType()),
+    NestedField(11, "country", StringType()),
+    NestedField(12, "signup_date", TimestampType()),
+    NestedField(13, "last_purchase_date", TimestampType()),
+    NestedField(14, "total_spent", DoubleType()),
+    NestedField(15, "is_vip", BooleanType()),
+    NestedField(16, "churned", BooleanType())
+)
+
+# Инициализация каталога
+catalog = load_catalog(
+    "sql",
+    uri="sqlite:///:memory:",
+)
+
+# Проверяем наличие пространства имен "default" в каталоге и создаём его, если нужно
+if "default" not in catalog.list_namespaces():
+    catalog.create_namespace("default")
+
+# Определяем схему партиционирования: по умолчанию берем разделение по полю region без трансформации
+partition_spec = PartitionSpec(fields=[
+    PartitionField(
+        field_id=9,        # идентификатор поля в Iceberg-схеме
+        source_id=9,       # исходный идентификатор колонки, используемой для партиционирования
+        name="region",       # человекочитаемое имя поля партиционирования
+        transform=IdentityTransform()  # прямое использование значения поля без преобразования
+    )
+])
+
+# Создаём таблицу, если её ещё нет, с указанной схемой, локацией, свойствами и спецификацией партиционирования
+if not catalog.table_exists("default.example_table"):
+    catalog.create_table(
+        identifier="default.example_table",
+        schema=iceberg_schema,
+        location="file:///content/iceberg_example_table",
+        properties={"format-version": "2"},
+        partition_spec=partition_spec
+    )
+
+# Загружаем таблицу из каталога для последующей работы с ней
+iceberg_table = catalog.load_table("default.example_table")
+
+# Приведём df к нужной схеме/типам (при необходимости)
+expected_cols = [
+    "record_date","first_name","last_name","birth_date","email","phone","address",
+    "city","region","postal_code","country","signup_date","last_purchase_date",
+    "total_spent","is_vip","churned"
+]
+
+# Приводим к нужному порядку, если столбцы совпадают по имени
+if all(c in df.columns for c in expected_cols):
+    df = df.reindex(columns=expected_cols)
+else:
+    print("Cтруктура паркета не совпадает с ожиданиями Iceberg")
+
+# Приведение типов под фактическую схему
+for col, dt in [
+    ("record_date","date"),("birth_date","date"),
+    ("signup_date","datetime"),("last_purchase_date","datetime"),
+    ("total_spent","float"),("is_vip","bool"),("churned","bool")
+]:
+    if col in df.columns:
+        if dt == "date":
+            df[col] = pd.to_datetime(df[col]).dt.date
+        elif dt == "datetime":
+            # downcast ns -> us, чтобы Iceberg принял запись
+            df[col] = pd.to_datetime(df[col], errors="coerce").astype("datetime64[us]")
+        elif dt == "float":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif dt == "bool":
+            df[col] = df[col].astype(bool)
+
+df_arrow = pa.Table.from_pandas(df)
+
+# Загружаем данные в Iceberg (запись через append)
+if not df.empty:
+    iceberg_table.append(df_arrow)
+    print("Данные добавлены в Iceberg.")
+else:
+    print("Пустой dataframe, ничего не записано")
+
+# Сканирование и проверка содержимого Iceberg после записи
+iceberg_table.inspect.entries()
+
+############################ 4-ая йчейка если в Google Colab #######################################
+#Запрос к таблице Iceberg
+
+# скан с фильтром
+scan = iceberg_table.scan(
+    row_filter=GreaterThanOrEqual("total_spent", 1000.0),
+    selected_fields=("first_name", "is_vip")
+)
+print("Количество клиентов с LTV > 1000 = ", len(scan.to_arrow()))
